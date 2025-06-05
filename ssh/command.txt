@@ -1,2 +1,2 @@
 # define ssh execute command
-nohup /usr/sbin/shutdown.sh > /dev/null 2>&1 &
+nohup halt -p > /dev/null 2>&1 &
