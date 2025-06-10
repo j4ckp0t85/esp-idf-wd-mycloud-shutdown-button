@@ -1,6 +1,8 @@
 # esp-idf-ssh-client
 ssh client for esp-idf.   
 This project use [this](https://github.com/libssh2/libssh2) ssh library.   
+The target is create a physical shutdown button. 
+In my case to properly shutdown a WD My Coud Gen2 Mirror (my father would only unplug the power supply, the NAS had to rebuild the raid at every consequent startup).
 
 # Software requirements
 esp-idf v4.4 or later.   
