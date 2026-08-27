@@ -175,41 +175,55 @@ static void gpio_task_example(void* arg)
     uint32_t io_num;
     for(;;) {
         if(xQueueReceive(gpio_evt_queue, &io_num, portMAX_DELAY)) {
-            printf("GPIO[%d] intr, val: %d\n", io_num, gpio_get_level(io_num));
-			gpio_set_level(GPIO_OUTPUT_IO_0, 1);
-			gpio_set_level(GPIO_OUTPUT_IO_1, 1);
-			ESP_LOGI(TAG, "Opening file");
-			FILE* fp = fopen("/spiffs/command.txt", "r");
-			if (fp == NULL) {
-				ESP_LOGE(TAG, "Failed to open file for reading");
-				return;
-			}
+            vTaskDelay(50 / portTICK_PERIOD_MS);
+            int level = gpio_get_level(io_num);
+            printf("GPIO[%d] intr, val: %d\n", io_num, level);
 
-			char line[256];
-			int count = 0;
-			while(fgets(line, sizeof(line), fp) != NULL) {
-				int lineLen = strlen(line);
-				line[lineLen-1] = 0;
-				ESP_LOGI(TAG, "line=[%s] lineLen=%d", line, lineLen);
-				if (lineLen == 1) continue;
-				if (line[0] == '#') continue;
+            gpio_set_level(GPIO_OUTPUT_IO_0, 1);
+            gpio_set_level(GPIO_OUTPUT_IO_1, 1);
+            ESP_LOGI(TAG, "Opening file");
+            FILE* fp = fopen("/spiffs/command.txt", "r");
+            if (fp == NULL) {
+                ESP_LOGE(TAG, "Failed to open file for reading");
+                gpio_set_level(GPIO_OUTPUT_IO_0, 0);
+                gpio_set_level(GPIO_OUTPUT_IO_1, 0);
+                continue;
+            }
 
-				// Execute ssh command
-				xEventGroupClearBits( xEventGroup, TASK_FINISH_BIT );
-				xTaskCreate(&ssh_task, "SSH" + count, 1024*8, (void *) &line, 2, NULL);
-				count = count + 1;
-				// Wit for ssh finish.
-				xEventGroupWaitBits( xEventGroup,
-					TASK_FINISH_BIT,	/* The bits within the event group to wait for. */
-					pdTRUE,				/* HTTP_CLOSE_BIT should be cleared before returning. */
-					pdFALSE,			/* Don't wait for both bits, either bit will do. */
-					portMAX_DELAY);		/* Wait forever. */
-			}
-			fclose(fp);
-			ESP_LOGI(TAG, "SSH all finish");
-			vTaskDelay(1000 / portTICK_PERIOD_MS);
-			gpio_set_level(GPIO_OUTPUT_IO_0, 0);
-			gpio_set_level(GPIO_OUTPUT_IO_1, 0);
+            char line[256];
+            int count = 0;
+            while(fgets(line, sizeof(line), fp) != NULL) {
+                int lineLen = strlen(line);
+                // Strip \r, \n, and trailing whitespace
+                while(lineLen > 0 && (line[lineLen-1] == '\r' || line[lineLen-1] == '\n' || isspace((unsigned char)line[lineLen-1]))) {
+                    line[--lineLen] = '\0';
+                }
+                ESP_LOGI(TAG, "line=[%s] lineLen=%d", line, lineLen);
+                if (lineLen == 0) continue;
+                if (line[0] == '#') continue;
+
+                // Execute ssh command
+                xEventGroupClearBits( xEventGroup, TASK_FINISH_BIT );
+                char taskName[16];
+                snprintf(taskName, sizeof(taskName), "SSH_%d", count);
+                xTaskCreate(&ssh_task, taskName, 1024*8, (void *) line, 2, NULL);
+                count = count + 1;
+
+                // Wait for ssh finish.
+                xEventGroupWaitBits( xEventGroup,
+                    TASK_FINISH_BIT,	/* The bits within the event group to wait for. */
+                    pdTRUE,				/* Clear bit on return */
+                    pdFALSE,			/* Don't wait for both bits */
+                    portMAX_DELAY);		/* Wait forever. */
+            }
+            fclose(fp);
+            ESP_LOGI(TAG, "SSH all finish");
+            vTaskDelay(1000 / portTICK_PERIOD_MS);
+            gpio_set_level(GPIO_OUTPUT_IO_0, 0);
+            gpio_set_level(GPIO_OUTPUT_IO_1, 0);
+
+            // Flush queue to ignore any bounce events that occurred while SSH was running
+            xQueueReset(gpio_evt_queue);
         }
     }
 }

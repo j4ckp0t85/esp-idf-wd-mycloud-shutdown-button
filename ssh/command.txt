@@ -1,2 +1,3 @@
 # define ssh execute command
-nohup halt -p > /dev/null 2>&1 &
+(sleep 2 && halt -p) > /dev/null 2>&1 &
+
