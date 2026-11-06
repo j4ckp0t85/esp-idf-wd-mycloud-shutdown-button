@@ -27,6 +27,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "driver/gpio.h"
+#include "ssh.h"
 
 #include "lwip/err.h"
 #include "lwip/sys.h"
@@ -53,7 +54,6 @@ static const char *TAG = "MAIN";
 static int s_retry_num = 0;
 
 EventGroupHandle_t xEventGroup;
-int TASK_FINISH_BIT	= BIT4;
 
 static QueueHandle_t gpio_evt_queue = NULL;
 
@@ -133,6 +133,8 @@ void wifi_init_sta(void)
 	ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA) );
 	ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config) );
 	ESP_ERROR_CHECK(esp_wifi_start() );
+	ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+	ESP_LOGI(TAG, "Wi-Fi power saving disabled (WIFI_PS_NONE)");
 
 	ESP_LOGI(TAG, "wifi_init_sta finished.");
 
@@ -162,12 +164,31 @@ void wifi_init_sta(void)
 	vEventGroupDelete(s_wifi_event_group);
 }
 
-void ssh_task(void *pvParameters);
-
 static void IRAM_ATTR gpio_isr_handler(void* arg)
 {
     uint32_t gpio_num = (uint32_t) arg;
     xQueueSendFromISR(gpio_evt_queue, &gpio_num, NULL);
+}
+
+static void indicate_result(EventBits_t result)
+{
+	ESP_LOGI(TAG, "Button result: %s", result == SSH_ACCEPTED_BIT ? "command acknowledged" :
+		result == SSH_UNKNOWN_BIT ? "unknown; check NAS before retrying" : "failed");
+	vTaskDelay(pdMS_TO_TICKS(1000));
+	gpio_set_level(GPIO_OUTPUT_IO_0, 0);
+	gpio_set_level(GPIO_OUTPUT_IO_1, 0);
+	if (result != SSH_ACCEPTED_BIT) {
+		int pulses = result == SSH_UNKNOWN_BIT ? 5 : 3;
+		for (int pulse = 0; pulse < pulses; ++pulse) {
+			vTaskDelay(pdMS_TO_TICKS(300));
+			gpio_set_level(GPIO_OUTPUT_IO_0, 1);
+			gpio_set_level(GPIO_OUTPUT_IO_1, 1);
+			vTaskDelay(pdMS_TO_TICKS(300));
+			gpio_set_level(GPIO_OUTPUT_IO_0, 0);
+			gpio_set_level(GPIO_OUTPUT_IO_1, 0);
+		}
+	}
+	xQueueReset(gpio_evt_queue);
 }
 
 static void gpio_task_example(void* arg)
@@ -178,6 +199,17 @@ static void gpio_task_example(void* arg)
             vTaskDelay(50 / portTICK_PERIOD_MS);
             int level = gpio_get_level(io_num);
             printf("GPIO[%d] intr, val: %d\n", io_num, level);
+			if (level != 0) continue;
+
+			wifi_ap_record_t ap_info;
+			esp_err_t wifi_status = esp_wifi_sta_get_ap_info(&ap_info);
+			if (wifi_status == ESP_OK) {
+				ESP_LOGI(TAG, "Wi-Fi before SSH: RSSI=%d dBm, channel=%u",
+					(int)ap_info.rssi, (unsigned int)ap_info.primary);
+			} else {
+				ESP_LOGW(TAG, "Wi-Fi AP information unavailable before SSH: %s",
+					esp_err_to_name(wifi_status));
+			}
 
             gpio_set_level(GPIO_OUTPUT_IO_0, 1);
             gpio_set_level(GPIO_OUTPUT_IO_1, 1);
@@ -185,13 +217,13 @@ static void gpio_task_example(void* arg)
             FILE* fp = fopen("/spiffs/command.txt", "r");
             if (fp == NULL) {
                 ESP_LOGE(TAG, "Failed to open file for reading");
-                gpio_set_level(GPIO_OUTPUT_IO_0, 0);
-                gpio_set_level(GPIO_OUTPUT_IO_1, 0);
+				indicate_result(SSH_FAILED_BIT);
                 continue;
             }
 
             char line[256];
             int count = 0;
+			EventBits_t result = SSH_FAILED_BIT;
             while(fgets(line, sizeof(line), fp) != NULL) {
                 int lineLen = strlen(line);
                 // Strip \r, \n, and trailing whitespace
@@ -203,27 +235,29 @@ static void gpio_task_example(void* arg)
                 if (line[0] == '#') continue;
 
                 // Execute ssh command
-                xEventGroupClearBits( xEventGroup, TASK_FINISH_BIT );
+				xEventGroupClearBits(xEventGroup, SSH_FINISH_BIT | SSH_RESULT_BITS);
                 char taskName[16];
                 snprintf(taskName, sizeof(taskName), "SSH_%d", count);
-                xTaskCreate(&ssh_task, taskName, 1024*8, (void *) line, 2, NULL);
+				if (xTaskCreate(&ssh_task, taskName, 1024*8, (void *) line, 2, NULL) != pdPASS) {
+					ESP_LOGE(TAG, "Failed to create SSH task");
+					result = SSH_FAILED_BIT;
+					break;
+				}
                 count = count + 1;
 
                 // Wait for ssh finish.
-                xEventGroupWaitBits( xEventGroup,
-                    TASK_FINISH_BIT,	/* The bits within the event group to wait for. */
+				EventBits_t bits = xEventGroupWaitBits( xEventGroup,
+					SSH_FINISH_BIT,	/* The bits within the event group to wait for. */
                     pdTRUE,				/* Clear bit on return */
                     pdFALSE,			/* Don't wait for both bits */
                     portMAX_DELAY);		/* Wait forever. */
+				result = bits & SSH_RESULT_BITS;
+				if (result != SSH_ACCEPTED_BIT) break;
             }
             fclose(fp);
-            ESP_LOGI(TAG, "SSH all finish");
-            vTaskDelay(1000 / portTICK_PERIOD_MS);
-            gpio_set_level(GPIO_OUTPUT_IO_0, 0);
-            gpio_set_level(GPIO_OUTPUT_IO_1, 0);
-
-            // Flush queue to ignore any bounce events that occurred while SSH was running
-            xQueueReset(gpio_evt_queue);
+			indicate_result(result);
+			ESP_LOGI(TAG, "Button task minimum free stack: %u bytes",
+				(unsigned int)uxTaskGetStackHighWaterMark(NULL));
         }
     }
 }
@@ -283,9 +317,10 @@ void app_main(void)
     io_conf.pull_up_en = 0;
     //configure GPIO with the given settings
     gpio_config(&io_conf);
+	gpio_set_level(GPIO_OUTPUT_IO_0, 0);
+	gpio_set_level(GPIO_OUTPUT_IO_1, 0);
 
-    //interrupt of rising edge
-    io_conf.intr_type = GPIO_INTR_POSEDGE;
+	io_conf.intr_type = GPIO_INTR_NEGEDGE;
     //bit mask of the pins, use GPIO4/5 here
     io_conf.pin_bit_mask = GPIO_INPUT_PIN_SEL;
     //set as input mode
@@ -295,12 +330,16 @@ void app_main(void)
     gpio_config(&io_conf);
 
     //change gpio interrupt type for one pin
-    gpio_set_intr_type(GPIO_INPUT_IO_0, GPIO_INTR_ANYEDGE);
+	gpio_set_intr_type(GPIO_INPUT_IO_0, GPIO_INTR_NEGEDGE);
 
     //create a queue to handle gpio event from isr
     gpio_evt_queue = xQueueCreate(10, sizeof(uint32_t));
     //start gpio task
-    xTaskCreate(gpio_task_example, "gpio_task_example", 2048, NULL, 10, NULL);
+	BaseType_t gpio_task_created = xTaskCreate(gpio_task_example, "gpio_task_example", 8192, NULL, 10, NULL);
+	if (gpio_task_created != pdPASS) {
+		ESP_LOGE(TAG, "Failed to create button task");
+		return;
+	}
 
     //install gpio isr service
     gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
